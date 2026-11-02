@@ -96,7 +96,7 @@ Verify your NRP access and local configuration:
 
 ## Create your first workspace
 
-Choose a unique workspace name. The cast of characters in (Alice and Bob)[https://en.wikipedia.org/wiki/Alice_and_Bob] is always a good option.
+Choose a unique workspace name. The cast of characters in [Alice and Bob](https://en.wikipedia.org/wiki/Alice_and_Bob) is always a good option.
 
 Workspace names should contain only lowercase letters, numbers, and hyphens.
 
