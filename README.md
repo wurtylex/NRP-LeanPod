@@ -22,6 +22,50 @@ Default workspace:
 >
 > Your persistent files will remain avalible after the pod is stopped.
 
+> [!WARNING]
+> ## Workspace names must be unique
+>
+> A workspace name identifies both its Kubernetes Deployment and its persistent storage.
+>
+> For example:
+>
+> ```bash
+> ./leanpod create alice
+> ```
+>
+> creates:
+>
+> ```text
+> Deployment: lean-alice
+> Storage:    lean-alice-home
+> ```
+>
+> If two people both use the name `alice`, they will operate on the **same workspace and the same persistent volume**.
+>
+> This means either person could:
+>
+> - modify the same files,
+> - change the workspace's CPU or memory settings,
+> - stop or delete the shared Deployment,
+> - or permanently delete the shared storage with `purge`.
+>
+> Use a unique identifier for the start of the workspace.
+> For example mine will look as follows:
+>
+> ```bash
+> ./leanpod create wurtle-alice
+> ```
+Or even
+> ```bash
+> ./leanpod create wurtle-bob
+> ```
+>
+> Before creating a workspace, list existing names:
+>
+> ```bash
+> ./leanpod list
+> ```
+
 ## Prerequisites
 
 ### NRP access
