@@ -1,0 +1,544 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Optional local configuration. Copy leanpod.env.example to leanpod.env.
+if [[ -f "$SCRIPT_DIR/leanpod.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/leanpod.env"
+fi
+
+NRP_NAMESPACE="${NRP_NAMESPACE:-prove2me}"
+NRP_CONTEXT="${NRP_CONTEXT:-nautilus}"
+NRP_KUBECONFIG="${NRP_KUBECONFIG:-$HOME/.kube/nrp-nautilus.config}"
+
+LEANPOD_IMAGE="${LEANPOD_IMAGE:-ghcr.io/leanprover-community/mathlib4/lean@sha256:ad7d671404b347b74e6ec2d5e4088b6afb5d124c5c47f075e323a5294707ea9b}"
+LEANPOD_CPU_REQUEST="${LEANPOD_CPU_REQUEST:-7}"
+LEANPOD_CPU_LIMIT="${LEANPOD_CPU_LIMIT:-8}"
+LEANPOD_MEMORY_REQUEST="${LEANPOD_MEMORY_REQUEST:-28Gi}"
+LEANPOD_MEMORY_LIMIT="${LEANPOD_MEMORY_LIMIT:-32Gi}"
+LEANPOD_STORAGE_SIZE="${LEANPOD_STORAGE_SIZE:-50Gi}"
+LEANPOD_STORAGE_CLASS="${LEANPOD_STORAGE_CLASS:-rook-ceph-block}"
+LEANPOD_REGION="${LEANPOD_REGION:-us-west}"
+
+PROVE2ME_REPO_URL="${PROVE2ME_REPO_URL:-https://github.com/prove2me/prove2me_workspace.git}"
+PROVE2ME_REPO_REF="${PROVE2ME_REPO_REF:-main}"
+PROVE2ME_TOOLCHAIN="${PROVE2ME_TOOLCHAIN:-leanprover/lean4:v4.33.1}"
+PROVE2ME_MATHLIB_REV="${PROVE2ME_MATHLIB_REV:-0df444a360eaa60ab8c11dca51a86af692955474}"
+
+k() {
+  kubectl \
+    --kubeconfig "$NRP_KUBECONFIG" \
+    --context "$NRP_CONTEXT" \
+    --namespace "$NRP_NAMESPACE" \
+    "$@"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  leanpod doctor
+  leanpod create NAME [options]
+  leanpod render NAME [options]
+  leanpod list
+  leanpod status NAME
+  leanpod wait NAME
+  leanpod shell NAME
+  leanpod logs NAME
+  leanpod start NAME
+  leanpod stop NAME
+  leanpod resize NAME [options]
+  leanpod expand NAME SIZE
+  leanpod delete NAME
+  leanpod purge NAME
+
+Create/render options:
+  --cpu-request N        Default: 7
+  --cpu-limit N          Default: 8
+  --memory-request SIZE  Default: 28Gi
+  --memory-limit SIZE    Default: 32Gi
+  --storage SIZE         Default: 50Gi
+  --storage-class NAME   Default: rook-ceph-block
+  --region NAME          Default: us-west
+  --image IMAGE          Override the pinned Lean base image
+  --toolchain VALUE      Lean toolchain, e.g. leanprover/lean4:v4.33.1
+  --mathlib-rev SHA      Exact Mathlib revision
+  --repo-ref REF         Prove2Me workspace branch/tag/commit; default main
+
+Resize options:
+  --cpu-request N
+  --cpu-limit N
+  --memory-request SIZE
+  --memory-limit SIZE
+
+Examples:
+  ./leanpod create alice
+  ./leanpod create bob --storage 100Gi
+  ./leanpod create carol --cpu-request 14 --cpu-limit 16 \
+    --memory-request 56Gi --memory-limit 64Gi
+  ./leanpod shell alice
+  ./leanpod stop alice
+  ./leanpod start alice
+  ./leanpod expand alice 100Gi
+  ./leanpod purge alice
+EOF
+}
+
+fail() {
+  printf 'leanpod: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+    || fail "NAME must be a lowercase Kubernetes name (letters, numbers, hyphens)."
+  ((${#name} <= 40)) || fail "NAME must be at most 40 characters."
+}
+
+resource_name() {
+  printf 'lean-%s' "$1"
+}
+
+pvc_name() {
+  printf 'lean-%s-home' "$1"
+}
+
+parse_create_options() {
+  CPU_REQUEST="$LEANPOD_CPU_REQUEST"
+  CPU_LIMIT="$LEANPOD_CPU_LIMIT"
+  MEMORY_REQUEST="$LEANPOD_MEMORY_REQUEST"
+  MEMORY_LIMIT="$LEANPOD_MEMORY_LIMIT"
+  STORAGE_SIZE="$LEANPOD_STORAGE_SIZE"
+  STORAGE_CLASS="$LEANPOD_STORAGE_CLASS"
+  REGION="$LEANPOD_REGION"
+  IMAGE="$LEANPOD_IMAGE"
+  TOOLCHAIN="$PROVE2ME_TOOLCHAIN"
+  MATHLIB_REV="$PROVE2ME_MATHLIB_REV"
+  REPO_REF="$PROVE2ME_REPO_REF"
+
+  while (($#)); do
+    case "$1" in
+      --cpu-request)       CPU_REQUEST="${2:?missing value}"; shift 2 ;;
+      --cpu-limit)         CPU_LIMIT="${2:?missing value}"; shift 2 ;;
+      --memory-request)    MEMORY_REQUEST="${2:?missing value}"; shift 2 ;;
+      --memory-limit)      MEMORY_LIMIT="${2:?missing value}"; shift 2 ;;
+      --storage)           STORAGE_SIZE="${2:?missing value}"; shift 2 ;;
+      --storage-class)     STORAGE_CLASS="${2:?missing value}"; shift 2 ;;
+      --region)            REGION="${2:?missing value}"; shift 2 ;;
+      --image)             IMAGE="${2:?missing value}"; shift 2 ;;
+      --toolchain)         TOOLCHAIN="${2:?missing value}"; shift 2 ;;
+      --mathlib-rev)       MATHLIB_REV="${2:?missing value}"; shift 2 ;;
+      --repo-ref)          REPO_REF="${2:?missing value}"; shift 2 ;;
+      -h|--help)           usage; exit 0 ;;
+      *) fail "unknown option: $1" ;;
+    esac
+  done
+}
+
+render_manifests() {
+  local short_name="$1"
+  local name pvc
+  name="$(resource_name "$short_name")"
+  pvc="$(pvc_name "$short_name")"
+
+  cat <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${pvc}
+  labels:
+    app.kubernetes.io/name: nrp-leanpod
+    app.kubernetes.io/instance: ${name}
+    leanpod-owner: ${short_name}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: ${STORAGE_SIZE}
+  storageClassName: ${STORAGE_CLASS}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${name}
+  labels:
+    app.kubernetes.io/name: nrp-leanpod
+    app.kubernetes.io/instance: ${name}
+    leanpod-owner: ${short_name}
+  annotations:
+    leanpod.nrp.ai/cpu-request: "${CPU_REQUEST}"
+    leanpod.nrp.ai/cpu-limit: "${CPU_LIMIT}"
+    leanpod.nrp.ai/memory-request: "${MEMORY_REQUEST}"
+    leanpod.nrp.ai/memory-limit: "${MEMORY_LIMIT}"
+    leanpod.nrp.ai/storage: "${STORAGE_SIZE}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: ${name}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nrp-leanpod
+        app.kubernetes.io/instance: ${name}
+        leanpod-owner: ${short_name}
+    spec:
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: prepare-workspace
+          image: busybox:1.36.1
+          command:
+            - sh
+            - -c
+            - mkdir -p /workspace && chown 1000:1000 /workspace
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: 20m
+              memory: 32Mi
+              ephemeral-storage: 32Mi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      containers:
+        - name: lean
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -euo pipefail
+
+              export HOME=/workspace/home
+              export ELAN_HOME=/workspace/.elan
+              export XDG_CACHE_HOME=/workspace/.cache
+              export PATH="/home/lean/.elan/bin:\${PATH}"
+
+              mkdir -p "\${HOME}" "\${ELAN_HOME}" "\${XDG_CACHE_HOME}" /workspace/work
+              rm -f /workspace/.leanpod-ready
+
+              repo=/workspace/prove2me_workspace
+              if [[ ! -d "\${repo}/.git" ]]; then
+                git clone "\${PROVE2ME_REPO_URL}" "\${repo}"
+                git -C "\${repo}" checkout "\${PROVE2ME_REPO_REF}"
+              fi
+
+              cd "\${repo}"
+
+              if [[ ! -f lean-toolchain ]]; then
+                printf '%s\\n' "\${PROVE2ME_TOOLCHAIN}" > lean-toolchain
+              fi
+
+              if [[ ! -f lakefile.lean ]]; then
+                cat > lakefile.lean <<LAKE
+              import Lake
+              open Lake DSL
+              package «prove2me» where
+                leanOptions := #[⟨\`autoImplicit, false⟩]
+
+              require mathlib from git
+                "https://github.com/leanprover-community/mathlib4.git" @
+                "\${PROVE2ME_MATHLIB_REV}"
+
+              lean_lib «Definitions» where
+              lean_lib «Theorems» where
+              @[default_target]
+              lean_lib «Solutions» where
+              LAKE
+              fi
+
+              lake update
+              lake exe cache get
+              lake build Solutions.SmokeTest
+
+              {
+                printf 'ready_at=%s\\n' "\$(date -u +%FT%TZ)"
+                printf 'toolchain=%s\\n' "\$(cat lean-toolchain)"
+                printf 'mathlib_rev=%s\\n' "\$(git -C .lake/packages/mathlib rev-parse HEAD)"
+                printf 'workspace_commit=%s\\n' "\$(git rev-parse HEAD)"
+              } > /workspace/.leanpod-ready
+
+              echo "Lean workspace ready at \${repo}"
+              echo "Use: ./leanpod shell ${short_name}"
+              exec tail -f /dev/null
+          env:
+            - name: HOME
+              value: /workspace/home
+            - name: ELAN_HOME
+              value: /workspace/.elan
+            - name: XDG_CACHE_HOME
+              value: /workspace/.cache
+            - name: PATH
+              value: /home/lean/.elan/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: PROVE2ME_REPO_URL
+              value: "${PROVE2ME_REPO_URL}"
+            - name: PROVE2ME_REPO_REF
+              value: "${REPO_REF}"
+            - name: PROVE2ME_TOOLCHAIN
+              value: "${TOOLCHAIN}"
+            - name: PROVE2ME_MATHLIB_REV
+              value: "${MATHLIB_REV}"
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -lc
+                - test -f /workspace/.leanpod-ready
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 180
+          resources:
+            requests:
+              cpu: "${CPU_REQUEST}"
+              memory: ${MEMORY_REQUEST}
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "${CPU_LIMIT}"
+              memory: ${MEMORY_LIMIT}
+              ephemeral-storage: 1200Mi
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: ${pvc}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - ${REGION}
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - amd64
+                  - key: feature.node.kubernetes.io/pci-10de.present
+                    operator: NotIn
+                    values:
+                      - "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
+EOF
+}
+
+cmd_doctor() {
+  command -v kubectl >/dev/null || fail "kubectl is not installed"
+  [[ -f "$NRP_KUBECONFIG" ]] || fail "kubeconfig not found: $NRP_KUBECONFIG"
+
+  printf 'Namespace: %s\n' "$NRP_NAMESPACE"
+  printf 'Context:   %s\n' "$NRP_CONTEXT"
+  printf 'Config:    %s\n\n' "$NRP_KUBECONFIG"
+
+  k auth can-i create deployments.apps
+  k auth can-i create persistentvolumeclaims
+  k auth can-i create pods/exec
+  k get resourcequota,limitrange
+}
+
+cmd_create() {
+  local short_name="${1:?NAME required}"
+  shift
+  validate_name "$short_name"
+  parse_create_options "$@"
+
+  render_manifests "$short_name" | k apply -f -
+
+  local name
+  name="$(resource_name "$short_name")"
+  cat <<EOF
+
+Created ${name} with:
+  CPU:     ${CPU_REQUEST} requested / ${CPU_LIMIT} limit
+  Memory:  ${MEMORY_REQUEST} requested / ${MEMORY_LIMIT} limit
+  Storage: ${STORAGE_SIZE} (${STORAGE_CLASS})
+  Region:  ${REGION}
+
+Watch startup:
+  $0 status ${short_name}
+  $0 logs ${short_name}
+  $0 wait ${short_name}
+
+Open a shell after it is ready:
+  $0 shell ${short_name}
+
+Stop it when idle:
+  $0 stop ${short_name}
+EOF
+}
+
+cmd_render() {
+  local short_name="${1:?NAME required}"
+  shift
+  validate_name "$short_name"
+  parse_create_options "$@"
+  render_manifests "$short_name"
+}
+
+cmd_list() {
+  k get deployments,pods,pvc \
+    -l app.kubernetes.io/name=nrp-leanpod \
+    -o wide
+}
+
+cmd_status() {
+  local short_name="${1:?NAME required}"
+  validate_name "$short_name"
+  local name
+  name="$(resource_name "$short_name")"
+  k get deployment "$name"
+  k get pods -l "app.kubernetes.io/instance=$name" -o wide
+  k get pvc "$(pvc_name "$short_name")"
+}
+
+cmd_wait() {
+  local short_name="${1:?NAME required}"
+  validate_name "$short_name"
+  local name
+  name="$(resource_name "$short_name")"
+  k rollout status "deployment/$name" --timeout=30m
+  k wait \
+    --for=condition=Ready \
+    pod \
+    -l "app.kubernetes.io/instance=$name" \
+    --timeout=30m
+}
+
+cmd_shell() {
+  local short_name="${1:?NAME required}"
+  validate_name "$short_name"
+  local name
+  name="$(resource_name "$short_name")"
+  k exec -it "deployment/$name" -- /bin/bash -lc 'cd /workspace/prove2me_workspace && exec /bin/bash --noprofile --norc' 
+}
+
+cmd_logs() {
+  local short_name="${1:?NAME required}"
+  validate_name "$short_name"
+  local name
+  name="$(resource_name "$short_name")"
+  k logs -f "deployment/$name" -c lean
+}
+
+cmd_start() {
+  local short_name="${1:?NAME required}"
+  validate_name "$short_name"
+  local name
+  name="$(resource_name "$short_name")"
+  k scale "deployment/$name" --replicas=1
+}
+
+cmd_stop() {
+  local short_name="${1:?NAME required}"
+  validate_name "$short_name"
+  local name
+  name="$(resource_name "$short_name")"
+  k scale "deployment/$name" --replicas=0
+}
+
+cmd_resize() {
+  local short_name="${1:?NAME required}"
+  shift
+  validate_name "$short_name"
+  local name
+  name="$(resource_name "$short_name")"
+
+  local cpu_request cpu_limit memory_request memory_limit
+  cpu_request="$(k get deployment "$name" -o jsonpath='{.spec.template.spec.containers[?(@.name=="lean")].resources.requests.cpu}')"
+  cpu_limit="$(k get deployment "$name" -o jsonpath='{.spec.template.spec.containers[?(@.name=="lean")].resources.limits.cpu}')"
+  memory_request="$(k get deployment "$name" -o jsonpath='{.spec.template.spec.containers[?(@.name=="lean")].resources.requests.memory}')"
+  memory_limit="$(k get deployment "$name" -o jsonpath='{.spec.template.spec.containers[?(@.name=="lean")].resources.limits.memory}')"
+
+  while (($#)); do
+    case "$1" in
+      --cpu-request)       cpu_request="${2:?missing value}"; shift 2 ;;
+      --cpu-limit)         cpu_limit="${2:?missing value}"; shift 2 ;;
+      --memory-request)    memory_request="${2:?missing value}"; shift 2 ;;
+      --memory-limit)      memory_limit="${2:?missing value}"; shift 2 ;;
+      *) fail "unknown resize option: $1" ;;
+    esac
+  done
+
+  k scale "deployment/$name" --replicas=0
+  k set resources "deployment/$name" \
+    --containers=lean \
+    --requests="cpu=$cpu_request,memory=$memory_request" \
+    --limits="cpu=$cpu_limit,memory=$memory_limit"
+
+  cat <<EOF
+Resized ${name}; it remains stopped.
+Start it with: $0 start ${short_name}
+EOF
+}
+
+cmd_expand() {
+  local short_name="${1:?NAME required}"
+  local size="${2:?SIZE required, e.g. 100Gi}"
+  validate_name "$short_name"
+  local pvc
+  pvc="$(pvc_name "$short_name")"
+  k patch pvc "$pvc" \
+    --type merge \
+    -p "{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"$size\"}}}}"
+}
+
+cmd_delete() {
+  local short_name="${1:?NAME required}"
+  validate_name "$short_name"
+  k delete deployment "$(resource_name "$short_name")" --ignore-not-found
+  printf 'PVC retained: %s\n' "$(pvc_name "$short_name")"
+}
+
+cmd_purge() {
+  local short_name="${1:?NAME required}"
+  validate_name "$short_name"
+  k delete deployment "$(resource_name "$short_name")" --ignore-not-found
+  k delete pvc "$(pvc_name "$short_name")" --ignore-not-found
+}
+
+main() {
+  local command="${1:-}"
+  case "$command" in
+    doctor) shift; cmd_doctor "$@" ;;
+    create) shift; cmd_create "$@" ;;
+    render) shift; cmd_render "$@" ;;
+    list) shift; cmd_list "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    wait) shift; cmd_wait "$@" ;;
+    shell) shift; cmd_shell "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    start) shift; cmd_start "$@" ;;
+    stop) shift; cmd_stop "$@" ;;
+    resize) shift; cmd_resize "$@" ;;
+    expand) shift; cmd_expand "$@" ;;
+    delete) shift; cmd_delete "$@" ;;
+    purge) shift; cmd_purge "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) fail "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

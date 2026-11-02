@@ -1,0 +1,3 @@
+leanpod.env
+*.yaml
+!examples/*.yaml
