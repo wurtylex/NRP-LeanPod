@@ -3,11 +3,42 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Optional local configuration. Copy leanpod.env.example to leanpod.env.
-if [[ -f "$SCRIPT_DIR/leanpod.env" ]]; then
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR/leanpod.env"
+# Configuration lookup order:
+#
+# 1. Explicit path from LEANPOD_CONFIG
+# 2. $XDG_CONFIG_HOME/leanpod/leanpod.env
+# 3. ~/.config/leanpod.env
+# 4. leanpod.env next to this executable, for backward compatibility
+
+LEANPOD_LOADED_CONFIG=""
+
+if [[ -n "${LEANPOD_CONFIG:-}" ]]; then
+  if [[ ! -r "$LEANPOD_CONFIG" ]]; then
+    printf 'leanpod: config file is not readable: %s\n' \
+      "$LEANPOD_CONFIG" >&2
+    exit 1
+  fi
+
+  LEANPOD_LOADED_CONFIG="$LEANPOD_CONFIG"
+else
+  for candidate in \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/leanpod/leanpod.env" \
+    "$HOME/.config/leanpod.env" \
+    "$SCRIPT_DIR/leanpod.env"
+  do
+    if [[ -r "$candidate" ]]; then
+      LEANPOD_LOADED_CONFIG="$candidate"
+      break
+    fi
+  done
 fi
+
+if [[ -n "$LEANPOD_LOADED_CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$LEANPOD_LOADED_CONFIG"
+fi
+
+readonly LEANPOD_LOADED_CONFIG
 
 NRP_NAMESPACE="${NRP_NAMESPACE:-prove2me}"
 NRP_CONTEXT="${NRP_CONTEXT:-nautilus}"
@@ -357,6 +388,8 @@ cmd_doctor() {
   printf 'Namespace: %s\n' "$NRP_NAMESPACE"
   printf 'Context:   %s\n' "$NRP_CONTEXT"
   printf 'Config:    %s\n\n' "$NRP_KUBECONFIG"
+  printf 'LeanPod config: %s\n\n' \
+    "${LEANPOD_LOADED_CONFIG:-<none; using built-in defaults>}"
 
   k auth can-i create deployments.apps
   k auth can-i create persistentvolumeclaims
