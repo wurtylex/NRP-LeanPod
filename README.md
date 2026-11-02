@@ -71,3 +71,92 @@ kubectl \
   get pods
 ```
 
+## Setup
+
+Clone the repository and enter its directory:
+
+```bash
+git clone https://github.com/wurtylex/NRP-LeanPod
+cd NRP-LeanPod
+```
+
+Create your local configuration file:
+
+```bash
+cp leanpod.env.example leanpod.env
+```
+
+You can edit `leanpod.env` to change your local defaults.
+
+Verify your NRP access and local configuration:
+
+```bash
+./leanpod doctor
+```
+
+## Create your first workspace
+
+Choose a unique workspace name. The cast of characters in (Alice and Bob)[https://en.wikipedia.org/wiki/Alice_and_Bob] is always a good option.
+
+Workspace names should contain only lowercase letters, numbers, and hyphens.
+
+```bash
+./leanpod create YOUR_NAME
+```
+
+For example:
+
+```bash
+./leanpod create wurtle
+```
+
+Watch the initial setup:
+
+```bash
+./leanpod logs YOUR_NAME
+```
+
+Wait until the workspace is ready:
+
+```bash
+./leanpod wait YOUR_NAME
+```
+
+Open a terminal inside the workspace:
+
+```bash
+./leanpod shell YOUR_NAME
+```
+
+## Stop your workspace
+
+When you are finished, stop the workspace so it no longer reserves CPU and memory:
+
+```bash
+./leanpod stop YOUR_NAME
+```
+
+Your files remain on persistent storage.
+
+Start it again later with:
+
+```bash
+./leanpod start YOUR_NAME
+./leanpod wait YOUR_NAME
+./leanpod shell YOUR_NAME
+```
+
+## More commands
+
+View all available commands and options:
+
+```bash
+./leanpod --help
+```
+
+You can also view help for an individual command:
+
+```bash
+./leanpod create --help
+./leanpod resize --help
+```
