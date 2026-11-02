@@ -59,7 +59,6 @@ Or even
 > ```bash
 > ./leanpod create wurtle-bob
 > ```
->
 > Before creating a workspace, list existing names:
 >
 > ```bash
